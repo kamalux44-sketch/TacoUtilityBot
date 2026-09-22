@@ -33,22 +33,23 @@ public sealed class RelayCommand : ApplicationCommandModule
         [Option("receive_channel", "音声を受信するVC（リレー元）")] DiscordChannel receiveChannel,
         [Option("transmit_channel", "音声を送信するVC（リレー先）")] DiscordChannel transmitChannel)
     {
+        await context.DeferAsync().ConfigureAwait(false);
         var guild = context.Guild;
         if (guild is null)
         {
-            await context.CreateResponseAsync("このコマンドはサーバー内で実行してください。").ConfigureAwait(false);
+            await EditResponseAsync(context, "このコマンドはサーバー内で実行してください。").ConfigureAwait(false);
             return;
         }
 
         if (receiveChannel.Type != ChannelType.Voice || transmitChannel.Type != ChannelType.Voice)
         {
-            await context.CreateResponseAsync("リレー元とリレー先にはボイスチャンネルを指定してください。").ConfigureAwait(false);
+            await EditResponseAsync(context, "リレー元とリレー先にはボイスチャンネルを指定してください。").ConfigureAwait(false);
             return;
         }
 
         if (receiveChannel.GuildId != guild.Id || transmitChannel.GuildId != guild.Id)
         {
-            await context.CreateResponseAsync("指定したVCは、このサーバーに存在する必要があります。").ConfigureAwait(false);
+            await EditResponseAsync(context, "指定したVCは、このサーバーに存在する必要があります。").ConfigureAwait(false);
             return;
         }
 
@@ -59,34 +60,35 @@ public sealed class RelayCommand : ApplicationCommandModule
             await _receiver.ConnectToReceiveChannelAsync(guild.Id, receiveChannel.Id).ConfigureAwait(false);
             await _transmitter.StartAsync(CancellationToken.None).ConfigureAwait(false);
             await _transmitter.ConnectToTransmitChannelAsync(guild.Id, transmitChannel.Id).ConfigureAwait(false);
-            await context.CreateResponseAsync($"音声リレーを開始しました。\n受信VC: {receiveChannel.Name}\n送信VC: {transmitChannel.Name}").ConfigureAwait(false);
+            await EditResponseAsync(context, $"音声リレーを開始しました。\n受信VC: {receiveChannel.Name}\n送信VC: {transmitChannel.Name}").ConfigureAwait(false);
         }
         catch (Exception exception)
         {
             _logger.LogError(exception, "Failed to start voice relay for guild {GuildId}.", guild.Id);
             await StopServicesAsync(guild.Id).ConfigureAwait(false);
-            await context.CreateResponseAsync($"リレー開始に失敗しました: {exception.Message}").ConfigureAwait(false);
+            await EditResponseAsync(context, $"リレー開始に失敗しました: {exception.Message}").ConfigureAwait(false);
         }
     }
 
     [SlashCommand("stop", "このサーバーのVC音声リレーを停止します。")]
     public async Task StopAsync(InteractionContext context)
     {
+        await context.DeferAsync().ConfigureAwait(false);
         if (context.Guild is null)
         {
-            await context.CreateResponseAsync("このコマンドはサーバー内で実行してください。").ConfigureAwait(false);
+            await EditResponseAsync(context, "このコマンドはサーバー内で実行してください。").ConfigureAwait(false);
             return;
         }
 
         try
         {
             await StopServicesAsync(context.Guild.Id).ConfigureAwait(false);
-            await context.CreateResponseAsync("このサーバーの音声リレーを停止しました。").ConfigureAwait(false);
+            await EditResponseAsync(context, "このサーバーの音声リレーを停止しました。").ConfigureAwait(false);
         }
         catch (Exception exception)
         {
             _logger.LogError(exception, "Failed to stop voice relay for guild {GuildId}.", context.Guild.Id);
-            await context.CreateResponseAsync($"リレー停止に失敗しました: {exception.Message}").ConfigureAwait(false);
+            await EditResponseAsync(context, $"リレー停止に失敗しました: {exception.Message}").ConfigureAwait(false);
         }
     }
 
@@ -113,5 +115,10 @@ public sealed class RelayCommand : ApplicationCommandModule
         _relay.Stop(guildId);
         await _transmitter.DisconnectAsync(guildId).ConfigureAwait(false);
         await _receiver.DisconnectAsync(guildId).ConfigureAwait(false);
+    }
+
+    private static Task EditResponseAsync(InteractionContext context, string message)
+    {
+        return context.EditResponseAsync(new DiscordWebhookBuilder().WithContent(message));
     }
 }
