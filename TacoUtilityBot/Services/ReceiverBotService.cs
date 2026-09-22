@@ -92,8 +92,22 @@ public sealed class ReceiverBotService : IAsyncDisposable
 
         if (receiverConnection is not null)
         {
-            receiverConnection.Connection.VoiceReceived -= receiverConnection.Handler;
-            receiverConnection.Connection.Disconnect();
+            try
+            {
+                receiverConnection.Connection.VoiceReceived -= receiverConnection.Handler;
+                receiverConnection.Connection.Disconnect();
+            }
+            finally
+            {
+                try
+                {
+                    receiverConnection.Connection.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    _logger.LogDebug(exception, "VoiceNext receiver connection disposal failed for guild {GuildId}.", guildId);
+                }
+            }
         }
 
         return Task.CompletedTask;

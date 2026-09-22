@@ -2,6 +2,7 @@ using DSharpPlus;
 using DSharpPlus.Entities;
 using DSharpPlus.SlashCommands;
 using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
 using TacoUtilityBot.Models;
 using TacoUtilityBot.Services;
 
@@ -14,6 +15,7 @@ public sealed class RelayCommand : ApplicationCommandModule
     private readonly ReceiverBotService _receiver;
     private readonly TransmitterBotService _transmitter;
     private readonly ILogger<RelayCommand> _logger;
+    private readonly ConcurrentDictionary<ulong, SemaphoreSlim> _guildOperations = new();
 
     public RelayCommand(
         AudioRelayService relay,
@@ -53,8 +55,16 @@ public sealed class RelayCommand : ApplicationCommandModule
             return;
         }
 
+        var operation = _guildOperations.GetOrAdd(guild.Id, _ => new SemaphoreSlim(1, 1));
+        await operation.WaitAsync().ConfigureAwait(false);
         try
         {
+            if (_relay.TryGetState(guild.Id, out VoiceRelayState? existingState) && existingState?.IsRunning == true)
+            {
+                await EditResponseAsync(context, "このサーバーでは既にリレーが稼働中です。").ConfigureAwait(false);
+                return;
+            }
+
             _relay.Start(guild.Id, receiveChannel.Id, transmitChannel.Id);
             await _receiver.StartAsync(CancellationToken.None).ConfigureAwait(false);
             await _receiver.ConnectToReceiveChannelAsync(guild.Id, receiveChannel.Id).ConfigureAwait(false);
@@ -68,6 +78,10 @@ public sealed class RelayCommand : ApplicationCommandModule
             await StopServicesAsync(guild.Id).ConfigureAwait(false);
             await EditResponseAsync(context, $"リレー開始に失敗しました: {exception.Message}").ConfigureAwait(false);
         }
+        finally
+        {
+            operation.Release();
+        }
     }
 
     [SlashCommand("stop", "このサーバーのVC音声リレーを停止します。")]
@@ -80,6 +94,8 @@ public sealed class RelayCommand : ApplicationCommandModule
             return;
         }
 
+        var operation = _guildOperations.GetOrAdd(context.Guild.Id, _ => new SemaphoreSlim(1, 1));
+        await operation.WaitAsync().ConfigureAwait(false);
         try
         {
             await StopServicesAsync(context.Guild.Id).ConfigureAwait(false);
@@ -89,6 +105,10 @@ public sealed class RelayCommand : ApplicationCommandModule
         {
             _logger.LogError(exception, "Failed to stop voice relay for guild {GuildId}.", context.Guild.Id);
             await EditResponseAsync(context, $"リレー停止に失敗しました: {exception.Message}").ConfigureAwait(false);
+        }
+        finally
+        {
+            operation.Release();
         }
     }
 
@@ -113,8 +133,14 @@ public sealed class RelayCommand : ApplicationCommandModule
     private async Task StopServicesAsync(ulong guildId)
     {
         _relay.Stop(guildId);
-        await _transmitter.DisconnectAsync(guildId).ConfigureAwait(false);
-        await _receiver.DisconnectAsync(guildId).ConfigureAwait(false);
+        try
+        {
+            await _transmitter.DisconnectAsync(guildId).ConfigureAwait(false);
+        }
+        finally
+        {
+            await _receiver.DisconnectAsync(guildId).ConfigureAwait(false);
+        }
     }
 
     private static Task EditResponseAsync(InteractionContext context, string message)

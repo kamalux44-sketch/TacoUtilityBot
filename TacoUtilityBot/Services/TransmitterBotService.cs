@@ -97,7 +97,21 @@ public sealed class TransmitterBotService : IAsyncDisposable
         }
 
         transmitterConnection.Cancellation.Dispose();
-        transmitterConnection.Connection.Disconnect();
+        try
+        {
+            transmitterConnection.Connection.Disconnect();
+        }
+        finally
+        {
+            try
+            {
+                transmitterConnection.Connection.Dispose();
+            }
+            catch (Exception exception)
+            {
+                _logger.LogDebug(exception, "VoiceNext transmitter connection disposal failed for guild {GuildId}.", guildId);
+            }
+        }
     }
 
     public async ValueTask DisposeAsync()
