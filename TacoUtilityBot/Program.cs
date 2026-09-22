@@ -16,8 +16,28 @@ var voiceRelayConfig = new VoiceRelayConfig
         : 100
 };
 var discordSection = builder.Configuration.GetSection("Discord");
-voiceRelayConfig.ReceiverToken = discordSection["ReceiverToken"] ?? string.Empty;
-voiceRelayConfig.TransmitterToken = discordSection["TransmitterToken"] ?? string.Empty;
+voiceRelayConfig.ReceiverToken = GetEnvironmentValue(
+    discordSection["ReceiverToken"],
+    "Discord__ReceiverToken",
+    "DISCORD_RECEIVER_TOKEN",
+    "ReceiverToken");
+voiceRelayConfig.TransmitterToken = GetEnvironmentValue(
+    discordSection["TransmitterToken"],
+    "Discord__TransmitterToken",
+    "DISCORD_TRANSMITTER_TOKEN",
+    "TransmitterToken");
+
+if (string.IsNullOrWhiteSpace(voiceRelayConfig.ReceiverToken))
+{
+    throw new InvalidOperationException(
+        "ReceiverBot token is not configured. Set Discord__ReceiverToken in the .env file.");
+}
+
+if (string.IsNullOrWhiteSpace(voiceRelayConfig.TransmitterToken))
+{
+    throw new InvalidOperationException(
+        "TransmitterBot token is not configured. Set Discord__TransmitterToken in the .env file.");
+}
 
 builder.Services.AddSingleton(voiceRelayConfig);
 builder.Services.AddSingleton<AudioRelayService>();
@@ -50,4 +70,23 @@ finally
     await transmitter.DisposeAsync();
     await receiver.DisposeAsync();
     await host.StopAsync();
+}
+
+static string GetEnvironmentValue(string? configuredValue, params string[] names)
+{
+    if (!string.IsNullOrWhiteSpace(configuredValue))
+    {
+        return configuredValue;
+    }
+
+    foreach (var name in names)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            return value;
+        }
+    }
+
+    return string.Empty;
 }
