@@ -1,0 +1,6 @@
+services:
+  tacoutilitybot:
+    image: ${DOCKER_REGISTRY-}tacoutilitybot
+    build:
+      context: .
+      dockerfile: TacoUtilityBot/Dockerfile
