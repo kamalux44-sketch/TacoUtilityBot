@@ -1,6 +1,10 @@
 services:
   tacoutilitybot:
     image: ${DOCKER_REGISTRY-}tacoutilitybot
+    container_name: tacoutilitybot
+    restart: unless-stopped
+    env_file:
+      - .env
     build:
       context: .
       dockerfile: TacoUtilityBot/Dockerfile

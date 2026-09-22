@@ -6,11 +6,5 @@ public sealed class VoiceRelayConfig
 
     public string TransmitterToken { get; set; } = string.Empty;
 
-    public ulong GuildId { get; set; }
-
-    public ulong ReceiveChannelId { get; set; }
-
-    public ulong TransmitChannelId { get; set; }
-
     public int MaxQueueSize { get; set; } = 100;
 }

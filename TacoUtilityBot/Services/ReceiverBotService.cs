@@ -1,4 +1,5 @@
 using DSharpPlus;
+using DSharpPlus.AsyncEvents;
 using DSharpPlus.Entities;
 using DSharpPlus.VoiceNext;
 using DSharpPlus.VoiceNext.EventArgs;
@@ -12,23 +13,21 @@ public sealed class ReceiverBotService : IAsyncDisposable
 {
     private readonly VoiceRelayConfig _config;
     private readonly AudioRelayService _relay;
-    private readonly VoiceRelayState _state;
     private readonly ILogger<ReceiverBotService> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly DiscordClient _client;
+    private readonly Dictionary<ulong, ReceiverConnection> _connections = new();
+    private readonly object _sync = new();
     private bool _started;
-    private VoiceNextConnection? _connection;
 
     public ReceiverBotService(
         VoiceRelayConfig config,
         AudioRelayService relay,
-        VoiceRelayState state,
         ILogger<ReceiverBotService> logger,
         ILoggerFactory loggerFactory)
     {
         _config = config;
         _relay = relay;
-        _state = state;
         _logger = logger;
         _loggerFactory = loggerFactory;
         _client = new DiscordClient(new DiscordConfiguration
@@ -43,8 +42,6 @@ public sealed class ReceiverBotService : IAsyncDisposable
             EnableIncoming = true
         });
     }
-
-    public bool IsConnected => _connection is not null;
 
     public DiscordClient Client => _client;
 
@@ -62,50 +59,71 @@ public sealed class ReceiverBotService : IAsyncDisposable
         _logger.LogInformation("ReceiverBot connected.");
     }
 
-    public async Task ConnectToReceiveChannelAsync(CancellationToken cancellationToken = default)
+    public async Task ConnectToReceiveChannelAsync(ulong guildId, ulong channelId, CancellationToken cancellationToken = default)
     {
-        var channel = await _client.GetChannelAsync(_config.ReceiveChannelId).ConfigureAwait(false);
-        if (channel.Type != ChannelType.Voice)
+        var channel = await _client.GetChannelAsync(channelId).ConfigureAwait(false);
+        if (channel.Type != ChannelType.Voice || channel.GuildId != guildId)
         {
-            throw new InvalidOperationException($"Receive channel {_config.ReceiveChannelId} is not a voice channel.");
+            throw new InvalidOperationException("受信チャンネルは指定したサーバーのボイスチャンネルである必要があります。");
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        _connection = await _client.GetVoiceNext().ConnectAsync(channel).ConfigureAwait(false);
-        _connection.VoiceReceived += OnVoiceReceivedAsync;
-        _state.ReceiveChannelId = channel.Id;
-        _logger.LogInformation("ReceiverBot joined receive channel {ChannelId}.", channel.Id);
-    }
+        await DisconnectAsync(guildId).ConfigureAwait(false);
+        var connection = await _client.GetVoiceNext().ConnectAsync(channel).ConfigureAwait(false);
+        AsyncEventHandler<VoiceNextConnection, VoiceReceiveEventArgs> handler =
+            (voiceConnection, eventArgs) => OnVoiceReceivedAsync(guildId, voiceConnection, eventArgs);
+        connection.VoiceReceived += handler;
 
-    public Task DisconnectAsync()
-    {
-        if (_connection is not null)
+        lock (_sync)
         {
-            _connection.VoiceReceived -= OnVoiceReceivedAsync;
-            _connection.Disconnect();
-            _connection = null;
+            _connections[guildId] = new ReceiverConnection(connection, handler);
         }
 
-        _state.ReceiveChannelId = null;
+        _logger.LogInformation("ReceiverBot joined receive channel {ChannelId} in guild {GuildId}.", channel.Id, guildId);
+    }
+
+    public Task DisconnectAsync(ulong guildId)
+    {
+        ReceiverConnection? receiverConnection;
+        lock (_sync)
+        {
+            _connections.Remove(guildId, out receiverConnection);
+        }
+
+        if (receiverConnection is not null)
+        {
+            receiverConnection.Connection.VoiceReceived -= receiverConnection.Handler;
+            receiverConnection.Connection.Disconnect();
+        }
+
         return Task.CompletedTask;
     }
 
     public async ValueTask DisposeAsync()
     {
-        await DisconnectAsync().ConfigureAwait(false);
+        ulong[] guildIds;
+        lock (_sync)
+        {
+            guildIds = _connections.Keys.ToArray();
+        }
+
+        foreach (var guildId in guildIds)
+        {
+            await DisconnectAsync(guildId).ConfigureAwait(false);
+        }
+
         await _client.DisconnectAsync().ConfigureAwait(false);
-        _started = false;
         _client.Dispose();
     }
 
-    private Task OnVoiceReceivedAsync(VoiceNextConnection connection, VoiceReceiveEventArgs eventArgs)
+    private Task OnVoiceReceivedAsync(ulong guildId, VoiceNextConnection connection, VoiceReceiveEventArgs eventArgs)
     {
         if (eventArgs.PcmData.Length == 0)
         {
             return Task.CompletedTask;
         }
 
-        _relay.TryEnqueue(new AudioPacket
+        _relay.TryEnqueue(guildId, new AudioPacket
         {
             PcmData = eventArgs.PcmData.ToArray(),
             UserId = eventArgs.User?.Id,
@@ -123,4 +141,8 @@ public sealed class ReceiverBotService : IAsyncDisposable
             throw new InvalidOperationException("Discord:ReceiverToken is not configured.");
         }
     }
+
+    private sealed record ReceiverConnection(
+        VoiceNextConnection Connection,
+        AsyncEventHandler<VoiceNextConnection, VoiceReceiveEventArgs> Handler);
 }

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using TacoUtilityBot.Configuration;
@@ -8,91 +9,122 @@ namespace TacoUtilityBot.Services;
 public sealed class AudioRelayService
 {
     private readonly VoiceRelayConfig _config;
-    private readonly VoiceRelayState _state;
     private readonly ILogger<AudioRelayService> _logger;
-    private readonly object _sync = new();
-    private Channel<AudioPacket> _channel;
-    private int _queued;
+    private readonly ConcurrentDictionary<ulong, RelaySession> _sessions = new();
 
-    public AudioRelayService(
-        VoiceRelayConfig config,
-        VoiceRelayState state,
-        ILogger<AudioRelayService> logger)
+    public AudioRelayService(VoiceRelayConfig config, ILogger<AudioRelayService> logger)
     {
         _config = config;
-        _state = state;
         _logger = logger;
-        _channel = CreateChannel();
     }
 
-    public void Start()
+    public void StopAll()
     {
-        lock (_sync)
+        foreach (var guildId in _sessions.Keys)
         {
-            if (_state.IsRunning)
-            {
-                return;
-            }
-
-            _channel = CreateChannel();
-            Interlocked.Exchange(ref _queued, 0);
-            _state.QueueLength = 0;
-            _state.IsRunning = true;
-            _logger.LogInformation("Voice relay queue started.");
+            Stop(guildId);
         }
     }
 
-    public void Stop()
+    public VoiceRelayState Start(ulong guildId, ulong receiveChannelId, ulong transmitChannelId)
     {
-        lock (_sync)
+        var session = _sessions.GetOrAdd(
+            guildId,
+            _ => new RelaySession(guildId, _config.MaxQueueSize, _logger));
+
+        lock (session.Sync)
         {
-            _state.IsRunning = false;
-            _channel.Writer.TryComplete();
-            while (_channel.Reader.TryRead(out _))
+            if (session.State.IsRunning)
             {
+                throw new InvalidOperationException("このサーバーでは既にリレーが稼働中です。");
             }
 
-            Interlocked.Exchange(ref _queued, 0);
-            _state.QueueLength = 0;
-            _logger.LogInformation("Voice relay queue stopped.");
+            session.Channel = CreateChannel();
+            session.Queued = 0;
+            session.State.ReceiveChannelId = receiveChannelId;
+            session.State.TransmitChannelId = transmitChannelId;
+            session.State.QueueLength = 0;
+            session.State.IsRunning = true;
+            _logger.LogInformation("Voice relay queue started for guild {GuildId}.", guildId);
+            return session.State;
         }
     }
 
-    public bool TryEnqueue(AudioPacket packet)
+    public bool TryGetState(ulong guildId, out VoiceRelayState? state)
     {
-        if (!_state.IsRunning)
+        if (_sessions.TryGetValue(guildId, out var session))
+        {
+            state = session.State;
+            return true;
+        }
+
+        state = null;
+        return false;
+    }
+
+    public void Stop(ulong guildId)
+    {
+        if (!_sessions.TryGetValue(guildId, out var session))
+        {
+            return;
+        }
+
+        lock (session.Sync)
+        {
+            session.State.IsRunning = false;
+            session.Channel.Writer.TryComplete();
+            while (session.Channel.Reader.TryRead(out _))
+            {
+            }
+
+            Interlocked.Exchange(ref session.Queued, 0);
+            session.State.QueueLength = 0;
+            session.State.ReceiveChannelId = null;
+            session.State.TransmitChannelId = null;
+            _logger.LogInformation("Voice relay queue stopped for guild {GuildId}.", guildId);
+        }
+    }
+
+    public bool TryEnqueue(ulong guildId, AudioPacket packet)
+    {
+        if (!_sessions.TryGetValue(guildId, out var session) || !session.State.IsRunning)
         {
             return false;
         }
 
-        while (_channel.Writer.TryWrite(packet) is false)
+        while (!session.Channel.Writer.TryWrite(packet))
         {
-            if (!_channel.Reader.TryRead(out _))
+            if (!session.Channel.Reader.TryRead(out _))
             {
                 return false;
             }
 
-            DecrementQueueLength();
+            DecrementQueueLength(session);
         }
 
-        _state.IncrementReceivedPackets();
-        Interlocked.Increment(ref _queued);
-        _state.QueueLength = Volatile.Read(ref _queued);
+        session.State.IncrementReceivedPackets();
+        Interlocked.Increment(ref session.Queued);
+        session.State.QueueLength = Volatile.Read(ref session.Queued);
         return true;
     }
 
-    public async ValueTask<AudioPacket> DequeueAsync(CancellationToken cancellationToken)
+    public async ValueTask<AudioPacket> DequeueAsync(ulong guildId, CancellationToken cancellationToken)
     {
-        var packet = await _channel.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
-        DecrementQueueLength();
-        _state.IncrementTransmittedPackets();
+        if (!_sessions.TryGetValue(guildId, out var session))
+        {
+            throw new InvalidOperationException("このサーバーのリレーセッションが存在しません。");
+        }
+
+        var packet = await session.Channel.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        DecrementQueueLength(session);
+        session.State.IncrementTransmittedPackets();
         return packet;
     }
 
-    private void DecrementQueueLength()
+    private static void DecrementQueueLength(RelaySession session)
     {
-        var length = Interlocked.Decrement(ref _queued);
-        _state.QueueLength = Math.Max(0, length);
+        var length = Interlocked.Decrement(ref session.Queued);
+        session.State.QueueLength = Math.Max(0, length);
     }
 
     private Channel<AudioPacket> CreateChannel()
@@ -104,5 +136,28 @@ public sealed class AudioRelayService
             SingleWriter = false,
             AllowSynchronousContinuations = false
         });
+    }
+
+    private sealed class RelaySession
+    {
+        public RelaySession(ulong guildId, int maxQueueSize, ILogger logger)
+        {
+            State = new VoiceRelayState { GuildId = guildId };
+            Channel = System.Threading.Channels.Channel.CreateBounded<AudioPacket>(new BoundedChannelOptions(Math.Max(1, maxQueueSize))
+            {
+                FullMode = BoundedChannelFullMode.Wait,
+                SingleReader = true,
+                SingleWriter = false,
+                AllowSynchronousContinuations = false
+            });
+        }
+
+        public object Sync { get; } = new();
+
+        public VoiceRelayState State { get; }
+
+        public Channel<AudioPacket> Channel { get; set; }
+
+        public int Queued;
     }
 }

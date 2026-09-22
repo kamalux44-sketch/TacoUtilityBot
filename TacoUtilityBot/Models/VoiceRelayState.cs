@@ -2,6 +2,8 @@ namespace TacoUtilityBot.Models;
 
 public sealed class VoiceRelayState
 {
+    public required ulong GuildId { get; init; }
+
     public bool IsRunning { get; internal set; }
 
     public ulong? ReceiveChannelId { get; internal set; }
@@ -18,13 +20,4 @@ public sealed class VoiceRelayState
 
     internal void IncrementTransmittedPackets() => TransmittedPackets++;
 
-    internal void Reset()
-    {
-        IsRunning = false;
-        ReceiveChannelId = null;
-        TransmitChannelId = null;
-        ReceivedPackets = 0;
-        TransmittedPackets = 0;
-        QueueLength = 0;
-    }
 }

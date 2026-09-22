@@ -11,9 +11,6 @@ var builder = Host.CreateApplicationBuilder(args);
 var voiceRelaySection = builder.Configuration.GetSection("VoiceRelay");
 var voiceRelayConfig = new VoiceRelayConfig
 {
-    GuildId = ParseId(voiceRelaySection["GuildId"]),
-    ReceiveChannelId = ParseId(voiceRelaySection["ReceiveChannelId"]),
-    TransmitChannelId = ParseId(voiceRelaySection["TransmitChannelId"]),
     MaxQueueSize = int.TryParse(voiceRelaySection["MaxQueueSize"], out var maxQueueSize)
         ? maxQueueSize
         : 100
@@ -23,7 +20,6 @@ voiceRelayConfig.ReceiverToken = discordSection["ReceiverToken"] ?? string.Empty
 voiceRelayConfig.TransmitterToken = discordSection["TransmitterToken"] ?? string.Empty;
 
 builder.Services.AddSingleton(voiceRelayConfig);
-builder.Services.AddSingleton<VoiceRelayState>();
 builder.Services.AddSingleton<AudioRelayService>();
 builder.Services.AddSingleton<ReceiverBotService>();
 builder.Services.AddSingleton<TransmitterBotService>();
@@ -38,7 +34,7 @@ var slashCommands = receiver.Client.UseSlashCommands(new SlashCommandsConfigurat
 {
     Services = host.Services
 });
-slashCommands.RegisterCommands<RelayCommand>(voiceRelayConfig.GuildId == 0 ? null : voiceRelayConfig.GuildId);
+slashCommands.RegisterCommands<RelayCommand>();
 
 try
 {
@@ -50,10 +46,8 @@ try
 }
 finally
 {
-    relay.Stop();
+    relay.StopAll();
     await transmitter.DisposeAsync();
     await receiver.DisposeAsync();
     await host.StopAsync();
 }
-
-static ulong ParseId(string? value) => ulong.TryParse(value, out var id) ? id : 0;

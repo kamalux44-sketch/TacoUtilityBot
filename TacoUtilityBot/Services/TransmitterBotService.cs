@@ -3,7 +3,6 @@ using DSharpPlus.Entities;
 using DSharpPlus.VoiceNext;
 using Microsoft.Extensions.Logging;
 using TacoUtilityBot.Configuration;
-using TacoUtilityBot.Models;
 
 namespace TacoUtilityBot.Services;
 
@@ -11,26 +10,21 @@ public sealed class TransmitterBotService : IAsyncDisposable
 {
     private readonly VoiceRelayConfig _config;
     private readonly AudioRelayService _relay;
-    private readonly VoiceRelayState _state;
     private readonly ILogger<TransmitterBotService> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly DiscordClient _client;
-    private bool _started;
+    private readonly Dictionary<ulong, TransmitterConnection> _connections = new();
     private readonly object _sync = new();
-    private VoiceNextConnection? _connection;
-    private CancellationTokenSource? _sendCts;
-    private Task? _sendTask;
+    private bool _started;
 
     public TransmitterBotService(
         VoiceRelayConfig config,
         AudioRelayService relay,
-        VoiceRelayState state,
         ILogger<TransmitterBotService> logger,
         ILoggerFactory loggerFactory)
     {
         _config = config;
         _relay = relay;
-        _state = state;
         _logger = logger;
         _loggerFactory = loggerFactory;
         _client = new DiscordClient(new DiscordConfiguration
@@ -42,8 +36,6 @@ public sealed class TransmitterBotService : IAsyncDisposable
         });
         _client.UseVoiceNext();
     }
-
-    public bool IsConnected => _connection is not null;
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -59,80 +51,79 @@ public sealed class TransmitterBotService : IAsyncDisposable
         _logger.LogInformation("TransmitterBot connected.");
     }
 
-    public async Task ConnectToTransmitChannelAsync(CancellationToken cancellationToken = default)
+    public async Task ConnectToTransmitChannelAsync(ulong guildId, ulong channelId, CancellationToken cancellationToken = default)
     {
-        var channel = await _client.GetChannelAsync(_config.TransmitChannelId).ConfigureAwait(false);
-        if (channel.Type != ChannelType.Voice)
+        var channel = await _client.GetChannelAsync(channelId).ConfigureAwait(false);
+        if (channel.Type != ChannelType.Voice || channel.GuildId != guildId)
         {
-            throw new InvalidOperationException($"Transmit channel {_config.TransmitChannelId} is not a voice channel.");
+            throw new InvalidOperationException("送信チャンネルは指定したサーバーのボイスチャンネルである必要があります。");
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        _connection = await _client.GetVoiceNext().ConnectAsync(channel).ConfigureAwait(false);
-        var sink = _connection.GetTransmitSink(20);
-        _state.TransmitChannelId = channel.Id;
+        await DisconnectAsync(guildId).ConfigureAwait(false);
+        var connection = await _client.GetVoiceNext().ConnectAsync(channel).ConfigureAwait(false);
+        var sink = connection.GetTransmitSink(20);
+        var sendCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var sendTask = SendLoopAsync(guildId, sink, sendCts.Token);
+
         lock (_sync)
         {
-            _sendCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            _sendTask = SendLoopAsync(sink, _sendCts.Token);
+            _connections[guildId] = new TransmitterConnection(connection, sendCts, sendTask);
         }
 
-        _logger.LogInformation("TransmitterBot joined transmit channel {ChannelId}.", channel.Id);
+        _logger.LogInformation("TransmitterBot joined transmit channel {ChannelId} in guild {GuildId}.", channel.Id, guildId);
     }
 
-    public async Task DisconnectAsync()
+    public async Task DisconnectAsync(ulong guildId)
     {
-        CancellationTokenSource? sendCts;
-        Task? sendTask;
+        TransmitterConnection? transmitterConnection;
         lock (_sync)
         {
-            sendCts = _sendCts;
-            sendTask = _sendTask;
-            _sendCts = null;
-            _sendTask = null;
+            _connections.Remove(guildId, out transmitterConnection);
         }
 
-        if (sendCts is not null)
+        if (transmitterConnection is null)
         {
-            await sendCts.CancelAsync().ConfigureAwait(false);
-            if (sendTask is not null)
-            {
-                try
-                {
-                    await sendTask.ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                }
-            }
-
-            sendCts.Dispose();
+            return;
         }
 
-        if (_connection is not null)
+        await transmitterConnection.Cancellation.CancelAsync().ConfigureAwait(false);
+        try
         {
-            _connection.Disconnect();
-            _connection = null;
+            await transmitterConnection.SendTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
         }
 
-        _state.TransmitChannelId = null;
+        transmitterConnection.Cancellation.Dispose();
+        transmitterConnection.Connection.Disconnect();
     }
 
     public async ValueTask DisposeAsync()
     {
-        await DisconnectAsync().ConfigureAwait(false);
+        ulong[] guildIds;
+        lock (_sync)
+        {
+            guildIds = _connections.Keys.ToArray();
+        }
+
+        foreach (var guildId in guildIds)
+        {
+            await DisconnectAsync(guildId).ConfigureAwait(false);
+        }
+
         await _client.DisconnectAsync().ConfigureAwait(false);
-        _started = false;
         _client.Dispose();
     }
 
-    private async Task SendLoopAsync(VoiceTransmitSink sink, CancellationToken cancellationToken)
+    private async Task SendLoopAsync(ulong guildId, VoiceTransmitSink sink, CancellationToken cancellationToken)
     {
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                var packet = await _relay.DequeueAsync(cancellationToken).ConfigureAwait(false);
+                var packet = await _relay.DequeueAsync(guildId, cancellationToken).ConfigureAwait(false);
                 await sink.WriteAsync(packet.PcmData, cancellationToken).ConfigureAwait(false);
             }
         }
@@ -141,7 +132,7 @@ public sealed class TransmitterBotService : IAsyncDisposable
         }
         catch (Exception exception)
         {
-            _logger.LogError(exception, "Failed to send audio.");
+            _logger.LogError(exception, "Failed to send audio for guild {GuildId}.", guildId);
         }
     }
 
@@ -152,4 +143,9 @@ public sealed class TransmitterBotService : IAsyncDisposable
             throw new InvalidOperationException("Discord:TransmitterToken is not configured.");
         }
     }
+
+    private sealed record TransmitterConnection(
+        VoiceNextConnection Connection,
+        CancellationTokenSource Cancellation,
+        Task SendTask);
 }
